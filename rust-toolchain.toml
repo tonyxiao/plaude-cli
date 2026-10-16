@@ -1,0 +1,5 @@
+# Keep local and CI checks on the same verified compiler/Clippy release.
+[toolchain]
+channel = "1.92.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
