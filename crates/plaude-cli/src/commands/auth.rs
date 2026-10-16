@@ -44,6 +44,11 @@ pub(crate) enum AuthCommand {
         /// Path to the btsnoop log file.
         path: PathBuf,
     },
+    /// Import existing paired Note Pro credentials from a private JSON file.
+    ImportPro {
+        /// JSON containing signed serial, RSA keys, and device binding token.
+        path: PathBuf,
+    },
     /// Show the fingerprint of the stored token without revealing
     /// its value.
     Show,
@@ -71,8 +76,14 @@ pub(crate) async fn run(cmd: AuthCommand, config_dir: Option<&Path>, backend: Ba
     match cmd {
         AuthCommand::SetToken { token } => set_token(store.as_ref(), &token).await,
         AuthCommand::Import { path } => import_from_log(store.as_ref(), &path).await,
+        AuthCommand::ImportPro { path } => import_pro(store.as_ref(), &path, config_dir).await,
         AuthCommand::Show => show(store.as_ref()).await,
-        AuthCommand::Clear => clear(store.as_ref()).await,
+        AuthCommand::Clear => {
+            plaud_auth::pro::clear(config_dir)
+                .await
+                .map_err(|e| DispatchError::Runtime(e.to_string()))?;
+            clear(store.as_ref()).await
+        }
         AuthCommand::Bootstrap(args) => bootstrap(store.as_ref(), args, backend).await,
     }
 }
@@ -151,7 +162,7 @@ async fn bootstrap(store: &dyn AuthStore, args: BootstrapArgs, backend: Backend)
     match backend {
         Backend::Sim => bootstrap_sim(store, args).await,
         Backend::Ble => bootstrap_ble(store, args).await,
-        Backend::Usb => Err(DispatchError::Usage(
+        Backend::Usb | Backend::Wifi => Err(DispatchError::Usage(
             "`auth bootstrap` is a BLE-peripheral flow; use `--backend sim` or wait for the btleplug backend".to_owned(),
         )),
     }
@@ -183,6 +194,7 @@ async fn bootstrap_sim(store: &dyn AuthStore, args: BootstrapArgs) -> Result<(),
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 async fn bootstrap_ble(store: &dyn AuthStore, args: BootstrapArgs) -> Result<(), DispatchError> {
     use plaud_transport_ble::bootstrap::bluer_peripheral::run_bluer_bootstrap;
 
@@ -205,4 +217,36 @@ fn map_bootstrap_error(err: BootstrapError) -> DispatchError {
         BootstrapError::DecodeFailed { reason } => DispatchError::Runtime(format!("captured write was not a valid auth frame: {reason}")),
         other => DispatchError::Runtime(format!("bootstrap error: {other}")),
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn bootstrap_ble(_store: &dyn AuthStore, _args: BootstrapArgs) -> Result<(), DispatchError> {
+    Err(DispatchError::Unavailable(
+        "automatic token capture currently requires Linux/BlueZ; use `plaude auth set-token <hex>` or `plaude auth import <btsnoop-log>`"
+            .to_owned(),
+    ))
+}
+
+async fn import_pro(store: &dyn AuthStore, path: &Path, config_dir: Option<&Path>) -> Result<(), DispatchError> {
+    let bytes = zeroize::Zeroizing::new(
+        tokio::fs::read(path)
+            .await
+            .map_err(|e| DispatchError::Runtime(format!("cannot read Pro credential file: {e}")))?,
+    );
+    let credentials: plaud_auth::pro::ProCredentials = serde_json::from_slice(&bytes).map_err(|_| {
+        DispatchError::Usage("invalid Pro credentials JSON: signed serial, matching RSA keys, and token are required".to_owned())
+    })?;
+    let token = AuthToken::new(credentials.token.clone()).map_err(|_| DispatchError::Usage("invalid Pro binding token".to_owned()))?;
+    plaud_transport_ble::crypto::validate_credentials(&credentials.sn_signature, &credentials.public_key, &credentials.private_key)
+        .map_err(|e| DispatchError::Usage(e.to_string()))?;
+    let fingerprint = token_fingerprint(&token);
+    plaud_auth::pro::save(&credentials, config_dir)
+        .await
+        .map_err(|e| DispatchError::Runtime(e.to_string()))?;
+    store
+        .put_token(DEFAULT_DEVICE_ID, token)
+        .await
+        .map_err(|e| DispatchError::Runtime(e.to_string()))?;
+    println!("Note Pro credentials stored. Fingerprint: {fingerprint}");
+    Ok(())
 }

@@ -38,6 +38,7 @@ pub mod constants;
 pub mod file_store;
 pub mod fingerprint;
 pub mod keyring_store;
+pub mod pro;
 
 pub use chain_store::ChainStore;
 pub use constants::DEFAULT_DEVICE_ID;

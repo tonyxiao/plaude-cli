@@ -84,3 +84,56 @@ fn auth_set_then_clear_then_show_returns_usage() {
     cmd(&tmp).args(["auth", "clear"]).assert().success();
     cmd(&tmp).args(["auth", "show"]).assert().code(EXPECTED_USAGE_EXIT);
 }
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn bootstrap_explains_supported_token_import_on_macos() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    cmd(&tmp)
+        .args(["auth", "bootstrap", "--timeout", "1"])
+        .assert()
+        .code(69)
+        .stderr(contains("auth set-token"))
+        .stderr(contains("Linux/BlueZ"));
+}
+
+#[test]
+fn pro_import_persists_paired_credentials_and_clear_removes_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("import.json");
+    let private = include_str!("../../plaud-transport-ble/tests/fixtures/pro-test-private.pem");
+    let public = include_str!("../../plaud-transport-ble/tests/fixtures/pro-test-public.pem");
+    std::fs::write(
+        &source,
+        serde_json::to_vec(&serde_json::json!({
+            "snSignature":"c2lnbmF0dXJl", "userRSAPrivateKey":private, "userRSAPublicKey":public, "token":SAMPLE_TOKEN
+        }))
+        .expect("JSON"),
+    )
+    .expect("fixture");
+    let output = cmd(&tmp).args(["auth", "import-pro"]).arg(&source).assert().success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert!(stdout.contains("Note Pro credentials stored"));
+    assert!(!stdout.contains(SAMPLE_TOKEN));
+    assert!(!stdout.contains("BEGIN PRIVATE KEY"));
+    cmd(&tmp).args(["auth", "show"]).assert().success();
+    let stored = tmp.path().join("pro-credentials.json");
+    assert!(stored.exists());
+    cmd(&tmp).args(["auth", "clear"]).assert().success();
+    assert!(!stored.exists());
+    cmd(&tmp).args(["auth", "show"]).assert().code(EXPECTED_USAGE_EXIT);
+}
+
+#[test]
+fn pro_import_rejects_invalid_credentials_without_storing_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("invalid.json");
+    std::fs::write(&source, r#"{"private_key":"do-not-print-this-secret"}"#).expect("fixture");
+    let output = cmd(&tmp)
+        .args(["auth", "import-pro"])
+        .arg(&source)
+        .assert()
+        .code(EXPECTED_USAGE_EXIT);
+    assert!(!String::from_utf8_lossy(&output.get_output().stderr).contains("do-not-print-this-secret"));
+    assert!(!tmp.path().join("pro-credentials.json").exists());
+}

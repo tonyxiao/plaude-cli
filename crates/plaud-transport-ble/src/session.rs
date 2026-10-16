@@ -12,13 +12,13 @@
 //! 2. **`send_control`** — writes an arbitrary control frame, waits
 //!    for the next notification, parses it via
 //!    [`plaud_proto::parse_notification`], returns the control-frame
-//!    payload (or errors on unexpected shapes).
+//!    payload (skipping unsolicited control notifications).
 //! 3. **`read_bulk`** — writes a bulk-trigger frame (typically the
 //!    `ReadFileChunk` opcode), then feeds every incoming frame
 //!    through a [`BulkReassembler`] until it sees a `BulkEnd`.
 //!
 //! The session is deliberately FIFO-ordered. Opcode-tagged
-//! correlation is a future enhancement — M5 callers always wait for
+//! correlation skips unsolicited updates while callers wait for
 //! the single response that belongs to the single request they just
 //! issued, which matches how the Plaud app itself operates.
 
@@ -37,10 +37,6 @@ use crate::{
 
 /// Error message when the inbound channel closes mid-flow.
 const ERR_CHANNEL_CLOSED: &str = "ble channel closed unexpectedly";
-
-/// Error message when a control-frame response arrives with an
-/// unexpected opcode.
-const ERR_OPCODE_MISMATCH: &str = "control response opcode mismatch";
 
 /// Error message when the reply to `send_control` is not a control
 /// frame (e.g. a bulk frame leaked through).
@@ -129,20 +125,28 @@ impl BleSession {
             .send(frame)
             .await
             .map_err(|_| Error::Transport(ERR_CHANNEL_CLOSED.to_owned()))?;
-        let bytes = tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, self.channel.rx.recv())
-            .await
-            .map_err(|_| Error::Timeout {
-                seconds: CONTROL_RESPONSE_TIMEOUT.as_secs(),
-            })?
-            .ok_or_else(|| Error::Transport(ERR_CHANNEL_CLOSED.to_owned()))?;
-        let parsed = plaud_proto::parse_notification(bytes).map_err(|e| Error::Protocol(format!("control response parse: {e}")))?;
-        match parsed {
-            Frame::Control { opcode, payload } if opcode == expected_opcode => Ok(payload),
-            Frame::Control { opcode, .. } => Err(Error::Protocol(format!(
-                "{ERR_OPCODE_MISMATCH}: expected 0x{expected_opcode:04x}, got 0x{opcode:04x}"
-            ))),
-            other => Err(Error::Protocol(format!("{ERR_EXPECTED_CONTROL}: {other:?}"))),
-        }
+        self.receive_control(expected_opcode, CONTROL_RESPONSE_TIMEOUT).await
+    }
+
+    async fn receive_control(&mut self, expected_opcode: u16, budget: Duration) -> Result<Bytes> {
+        tokio::time::timeout(budget, async {
+            loop {
+                let bytes = self
+                    .channel
+                    .rx
+                    .recv()
+                    .await
+                    .ok_or_else(|| Error::Transport(ERR_CHANNEL_CLOSED.to_owned()))?;
+                let parsed = plaud_proto::parse_notification(bytes).map_err(|e| Error::Protocol(format!("control response parse: {e}")))?;
+                match parsed {
+                    Frame::Control { opcode, payload } if opcode == expected_opcode => return Ok(payload),
+                    Frame::Control { opcode, .. } => tracing::debug!(opcode, expected_opcode, "ignoring unsolicited control notification"),
+                    _ => return Err(Error::Protocol(ERR_EXPECTED_CONTROL.to_owned())),
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout { seconds: budget.as_secs() })?
     }
 
     /// Send a control frame for a multi-response opcode and collect
@@ -169,32 +173,10 @@ impl BleSession {
             } else {
                 Duration::from_secs(3)
             };
-            let recv = tokio::time::timeout(timeout, self.channel.rx.recv()).await;
-            match recv {
-                Err(_) => {
-                    if responses.is_empty() {
-                        return Err(Error::Timeout {
-                            seconds: CONTROL_RESPONSE_TIMEOUT.as_secs(),
-                        });
-                    }
-                    break;
-                }
-                Ok(None) => return Err(Error::Transport(ERR_CHANNEL_CLOSED.to_owned())),
-                Ok(Some(bytes)) => {
-                    let parsed =
-                        plaud_proto::parse_notification(bytes).map_err(|e| Error::Protocol(format!("multi-response parse: {e}")))?;
-                    match parsed {
-                        Frame::Control { opcode, payload } if opcode == expected_opcode => {
-                            responses.push(payload);
-                        }
-                        Frame::Control { opcode, .. } => {
-                            return Err(Error::Protocol(format!(
-                                "{ERR_OPCODE_MISMATCH}: expected 0x{expected_opcode:04x}, got 0x{opcode:04x}"
-                            )));
-                        }
-                        _ => break,
-                    }
-                }
+            match self.receive_control(expected_opcode, timeout).await {
+                Ok(payload) => responses.push(payload),
+                Err(Error::Timeout { .. }) if !responses.is_empty() => break,
+                Err(error) => return Err(error),
             }
         }
         Ok(responses)

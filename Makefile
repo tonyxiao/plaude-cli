@@ -4,6 +4,14 @@ CARGO ?= cargo
 PROFILE ?= release
 TARGET_DIR ?= target
 
+# A stable certificate-backed identity lets Keychain "Always Allow" survive
+# rebuilds. Linker-generated ad-hoc signatures use a new identity each build.
+# With multiple signing identities, choose one explicitly when installing.
+ifeq ($(shell uname -s),Darwin)
+  CODESIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk 'length($$2)==40 {count++; id=$$2} END {if(count==1) print id}')
+  CODESIGN_IDENTIFIER ?= com.tonyxiao.plaude-cli
+endif
+
 VERSION   = $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 GIT_COMMIT = $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 
@@ -70,6 +78,13 @@ man: build
 install: build
 	@mkdir -p $(HOME)/.cargo/bin
 	cp $(TARGET_DIR)/$(PROFILE)/plaude $(HOME)/.cargo/bin/plaude
+ifeq ($(shell uname -s),Darwin)
+	@if [ -n "$(CODESIGN_IDENTITY)" ]; then \
+		codesign --force --sign "$(CODESIGN_IDENTITY)" --identifier "$(CODESIGN_IDENTIFIER)" --timestamp=none $(HOME)/.cargo/bin/plaude; \
+	else \
+		echo "No unique signing identity found. Keychain trust may reset after rebuilds; set CODESIGN_IDENTITY when installing."; \
+	fi
+endif
 	@echo "Installed plaude to $(HOME)/.cargo/bin/plaude"
 	@if [ -f $(TARGET_DIR)/man/plaude.1 ]; then \
 		mkdir -p $(HOME)/.local/share/man/man1; \

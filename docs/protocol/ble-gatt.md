@@ -100,3 +100,21 @@ bridge between the two chips on the device side.
 - [`specs/re/captures/btsnoop/2026-04-05-plaud-sync-session.md`](../../specs/re/captures/btsnoop/2026-04-05-plaud-sync-session.md)
   — R2 dynamic capture: full GATT map, frame format, opcode dictionary,
   session timeline, sanitisation log.
+
+## Note Pro on macOS (2026-10-16)
+
+Observed using CoreBluetooth on an Apple Silicon Mac: local name
+`Plaud Note Pro`, manufacturer ID `0x005d`, advertised service `0x504c`.
+The device exposes the same vendor service `0x1910` and control
+characteristics `0x2bb1` / `0x2bb0`, plus battery `0x2a19`.
+
+CoreBluetooth sometimes omits the local name on later scans. Discovery may
+fall back to the canonical Pro name only when both the observed manufacturer
+ID and discovery service match. Authenticated protocol compatibility remains
+unverified; the original Note's manufacturer/name requirements still apply.
+
+An Android HCI capture confirms this Pro uses `0xfe10` handshake fragments and
+encrypted control traffic rather than plaintext token authentication. Physical
+ATT control-write handle was `0x0022`; CoreBluetooth reported `0x0021` through
+its public characteristic handle API, so do not treat that API value as a
+portable raw ATT handle. The missing M16 encrypted transport is required.

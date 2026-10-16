@@ -23,3 +23,5 @@ pub(crate) mod sync;
 pub(crate) mod template;
 #[cfg(feature = "transcribe")]
 pub(crate) mod transcribe;
+
+pub(crate) mod wifi;

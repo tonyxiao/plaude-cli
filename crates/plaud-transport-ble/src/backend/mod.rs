@@ -11,4 +11,4 @@
 
 mod adapter;
 
-pub use adapter::{BtleplugBatteryReader, BtleplugScanProvider, connect_peripheral};
+pub use adapter::{BtleplugBatteryReader, BtleplugScanProvider, connect_peripheral, connect_pro_peripheral};

@@ -120,38 +120,47 @@ async fn pull_one(args: PullOneArgs, provider: &dyn TransportProvider, config_di
     let wav_size = meta.as_ref().map_or(0, |m| m.wav_size());
     let asr_size = meta.as_ref().map_or(0, |m| m.asr_size());
 
-    let wav_written = pull_file(transport.as_ref(), &recording_id, FileKind::Wav, wav_size, &wav_path, args.resume).await?;
-    // ASR sidecar — best-effort
-    let asr_written = pull_file(transport.as_ref(), &recording_id, FileKind::Asr, asr_size, &asr_path, args.resume)
-        .await
-        .unwrap_or_default();
-
-    // If the WAV file was written but doesn't start with RIFF (BLE
-    // path: device sends raw Opus frames as the "recording"), save
-    // the raw data as .asr and decode it to a playable PCM WAV.
-    if wav_written {
-        if let Ok(raw_data) = tokio::fs::read(&wav_path).await {
-            if raw_data.len() >= 4 && &raw_data[..4] != b"RIFF" && is_likely_opus(&raw_data) {
-                // Not a real WAV — it's raw Opus from BLE. Save as .asr.
-                tokio::fs::write(&asr_path, &raw_data).await.unwrap_or_default();
-                // Decode Opus → PCM WAV
-                match super::decode::opus_to_wav(&raw_data) {
-                    Ok(wav_data) => {
-                        tokio::fs::write(&wav_path, &wav_data)
-                            .await
-                            .map_err(|e| DispatchError::Runtime(format!("failed to write decoded WAV: {e}")))?;
-                        let bar = ProgressBar::new(wav_data.len() as u64);
-                        if let Ok(style) = ProgressStyle::with_template(PROGRESS_TEMPLATE) {
-                            bar.set_style(style.progress_chars(PROGRESS_CHARS));
-                        }
-                        bar.set_message(format!("{} decoded wav", recording_id.as_str()));
-                        bar.set_position(wav_data.len() as u64);
-                        bar.finish();
-                    }
-                    Err(e) => eprintln!("warning: could not decode Opus to WAV: {e}"),
-                }
-            }
+    let primary = if args.resume
+        && (file_is_already_complete(&wav_path, wav_size).await?
+            || (wav_size == 0 && converted_wav_is_complete(&wav_path, &asr_path, asr_size).await))
+    {
+        None
+    } else {
+        Some(download_bytes(transport.as_ref(), &recording_id, FileKind::Wav, wav_size).await?)
+    };
+    let wav_written = primary.is_some();
+    let raw_audio = primary.as_ref().is_some_and(|bytes| {
+        plaud_transport_ble::encrypted_file::is_encrypted(bytes) || bytes.starts_with(b"OggS") || is_likely_opus(bytes)
+    });
+    let asr_written = if raw_audio {
+        if let Some(bytes) = &primary {
+            publish_wav(&asr_path, bytes.clone()).await?;
         }
+        true
+    } else {
+        pull_file(transport.as_ref(), &recording_id, FileKind::Asr, asr_size, &asr_path, args.resume)
+            .await
+            .unwrap_or_default()
+    };
+    if let Some(raw) = primary {
+        let wav = if plaud_transport_ble::encrypted_file::is_encrypted(&raw) {
+            let credentials = plaud_auth::pro::load(config_dir)
+                .await
+                .map_err(|e| DispatchError::Runtime(e.to_string()))?
+                .ok_or_else(|| DispatchError::Runtime("Pro recording decryption requires imported paired credentials".to_owned()))?;
+            let ogg = plaud_transport_ble::encrypted_file::decrypt(&raw, &credentials.private_key)
+                .map_err(|e| DispatchError::Runtime(e.to_string()))?;
+            export_ogg_artifacts(&wav_path, &ogg).await?;
+            super::decode::ogg_to_wav(&ogg).map_err(DispatchError::Runtime)?
+        } else if raw.starts_with(b"OggS") {
+            export_ogg_artifacts(&wav_path, &raw).await?;
+            super::decode::ogg_to_wav(&raw).map_err(DispatchError::Runtime)?
+        } else if is_likely_opus(&raw) {
+            super::decode::opus_to_wav(&raw).map_err(DispatchError::Runtime)?
+        } else {
+            raw
+        };
+        publish_wav(&wav_path, wav).await?;
     }
 
     if !wav_written && !asr_written {
@@ -192,6 +201,20 @@ async fn pull_file(
     if resume && file_is_already_complete(path, expected_size).await? {
         return Ok(false);
     }
+    let bytes = download_bytes(transport, id, kind, expected_size).await?;
+
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| DispatchError::Runtime(format!("{PARTIAL_FILE_REWRITE_CONTEXT} {}: {e}", path.display())))?;
+    }
+    tokio::fs::write(path, &bytes)
+        .await
+        .map_err(|e| DispatchError::Runtime(format!("failed to write {}: {e}", path.display())))?;
+    Ok(true)
+}
+
+async fn download_bytes(transport: &dyn Transport, id: &RecordingId, kind: FileKind, expected_size: u64) -> Result<Vec<u8>, DispatchError> {
     // Show a progress bar during download. For BLE transfers this can
     // take minutes; for USB/sim it's instant.
     let bar = ProgressBar::new(expected_size);
@@ -216,15 +239,62 @@ async fn pull_file(
     bar.set_position(bytes.len() as u64);
     bar.finish();
 
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| DispatchError::Runtime(format!("{PARTIAL_FILE_REWRITE_CONTEXT} {}: {e}", path.display())))?;
+    Ok(bytes)
+}
+
+async fn export_ogg_artifacts(wav_path: &Path, ogg: &[u8]) -> Result<(), DispatchError> {
+    let metadata = super::decode::recording_metadata(ogg).map_err(DispatchError::Runtime)?;
+    publish_wav(&wav_path.with_extension("ogg"), ogg.to_vec()).await?;
+    let json = serde_json::to_vec_pretty(&metadata).map_err(|e| DispatchError::Runtime(e.to_string()))?;
+    publish_wav(&wav_path.with_extension("metadata.json"), json).await
+}
+
+async fn publish_wav(path: &Path, bytes: Vec<u8>) -> Result<(), DispatchError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path.parent().ok_or_else(|| std::io::Error::other("missing output directory"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(&bytes)?;
+        temporary.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| DispatchError::Runtime("file publication task failed".to_owned()))?
+    .map_err(|e| DispatchError::Runtime(format!("failed to publish file: {e}")))
+}
+
+async fn converted_wav_is_complete(wav: &Path, asr: &Path, expected_asr_size: u64) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(asr).await else {
+        return false;
+    };
+    if metadata.len() == 0 || (expected_asr_size > 0 && metadata.len() != expected_asr_size) {
+        return false;
     }
-    tokio::fs::write(path, &bytes)
-        .await
-        .map_err(|e| DispatchError::Runtime(format!("failed to write {}: {e}", path.display())))?;
-    Ok(true)
+    let wav = wav.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let Ok(mut file) = std::fs::File::open(wav) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        let mut header = [0; 44];
+        if file.read_exact(&mut header).is_err() {
+            return false;
+        }
+        let data_size = u32::from_le_bytes([header[40], header[41], header[42], header[43]]);
+        let riff_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        &header[..4] == b"RIFF"
+            && &header[8..12] == b"WAVE"
+            && &header[36..40] == b"data"
+            && data_size > 0
+            && u64::from(data_size) + 44 == metadata.len()
+            && u64::from(riff_size) + 8 == metadata.len()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Heuristic: check if data looks like raw Opus frames (each 80 bytes,
@@ -372,6 +442,7 @@ mod tests {
     use plaud_domain::{Recording, RecordingId, RecordingKind};
     use serde_json::Value;
 
+    use super::converted_wav_is_complete;
     use super::{ALREADY_UP_TO_DATE_MSG, ASR_EXTENSION, RecordingJson, TEXT_TABLE_HEADER, WAV_EXTENSION};
 
     const BASENAME: &str = "1775393534";
@@ -403,5 +474,22 @@ mod tests {
         assert_eq!(WAV_EXTENSION, "wav");
         assert_eq!(ASR_EXTENSION, "asr");
         assert!(ALREADY_UP_TO_DATE_MSG.contains("up to date"));
+    }
+    #[tokio::test]
+    async fn resume_recognizes_converted_wav_using_preserved_container_size() {
+        let dir = tempfile::tempdir().expect("output");
+        let wav = dir.path().join("recording.wav");
+        let asr = dir.path().join("recording.asr");
+        std::fs::write(&asr, b"container").expect("ASR");
+        let header: [u8; 48] = [
+            82, 73, 70, 70, 40, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 1, 0, 128, 62, 0, 0, 0, 125, 0, 0, 2, 0, 16,
+            0, 100, 97, 116, 97, 4, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        std::fs::write(&wav, header).expect("WAV");
+        assert!(converted_wav_is_complete(&wav, &asr, 9).await);
+        assert!(!converted_wav_is_complete(&wav, &asr, 10).await);
+        assert!(converted_wav_is_complete(&wav, &asr, 0).await);
+        std::fs::write(&wav, b"not a WAV").expect("corrupt WAV");
+        assert!(!converted_wav_is_complete(&wav, &asr, 9).await);
     }
 }

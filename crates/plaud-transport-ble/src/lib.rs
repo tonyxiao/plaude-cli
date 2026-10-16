@@ -21,7 +21,9 @@ pub mod bootstrap;
 pub mod bulk;
 pub mod channel;
 pub mod constants;
+pub mod crypto;
 pub mod discovery;
+pub mod encrypted_file;
 pub mod session;
 pub mod transport;
 

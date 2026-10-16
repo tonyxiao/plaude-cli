@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,29 +16,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.92.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: make lint
-        run: make lint
+      - name: Install Linux Bluetooth dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Clippy portable features
+        run: cargo clippy --workspace --no-default-features --all-targets -- -D warnings
+      - name: Formatting
+        run: cargo fmt --all --check
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
-      - name: make test
-        run: make test
+      - name: Install Linux Bluetooth dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Test portable features
+        run: cargo test --workspace --no-default-features
 
   build:
     name: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
-      - name: make build
-        run: make build
+      - name: Install Linux Bluetooth dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build portable CLI
+        run: cargo build --release -p plaude-cli --no-default-features --features llm
+
+  macos:
+    name: macOS build and regression tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native build dependency
+        run: brew list cmake || brew install cmake
+      - name: Test portable CLI and protocol
+        run: cargo test --workspace --no-default-features
+      - name: Build and test Metal transcription
+        run: cargo test -p plaude-cli --no-default-features --features transcribe,llm
+      - name: Clippy
+        run: cargo clippy --workspace --no-default-features --all-targets -- -D warnings

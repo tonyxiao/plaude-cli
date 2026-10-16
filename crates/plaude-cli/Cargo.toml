@@ -16,6 +16,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 plaud-auth = { workspace = true }
 plaud-domain = { workspace = true }
 plaud-transport = { workspace = true }
@@ -23,14 +24,19 @@ plaud-sim = { workspace = true }
 plaud-llm = { workspace = true, optional = true }
 plaud-transport-ble = { workspace = true, features = ["btleplug-backend"] }
 plaud-transport-usb = { workspace = true }
+plaud-transport-wifi = { workspace = true }
+getrandom = "0.2"
 plaud-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 indicatif = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
+tempfile = { workspace = true }
 jiff = { workspace = true }
 dirs = { workspace = true }
 opus-decoder = { workspace = true }
+ogg = { workspace = true }
 whisper-rs = { workspace = true, optional = true }
 hound = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
@@ -51,3 +57,9 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+whisper-rs = { workspace = true, optional = true, features = ["cuda", "vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { workspace = true, optional = true, features = ["metal"] }

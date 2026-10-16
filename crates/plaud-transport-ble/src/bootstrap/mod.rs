@@ -17,10 +17,10 @@
 pub mod loopback;
 pub mod session;
 
-#[cfg(feature = "btleplug-backend")]
+#[cfg(all(feature = "btleplug-backend", target_os = "linux"))]
 pub mod bluer_peripheral;
 
-#[cfg(feature = "btleplug-backend")]
+#[cfg(all(feature = "btleplug-backend", target_os = "linux"))]
 pub use bluer_peripheral::run_bluer_bootstrap;
 pub use loopback::{LoopbackBootstrap, TestPhone};
 pub use session::{BootstrapChannel, BootstrapError, BootstrapOutcome, BootstrapSession};

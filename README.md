@@ -16,10 +16,21 @@ Connects directly over Bluetooth — **no cloud, no phone app** needed after a o
 
 ## Install
 
-Requirements: Rust 1.85+, Linux with BlueZ.
+Requirements: Rust 1.85+. Linux requires BlueZ; macOS uses CoreBluetooth.
+
+On Apple Silicon macOS, install CMake (`brew install cmake`) before building.
+Transcription uses Metal on macOS. BLE discovery supports both the original
+`PLAUD_NOTE` advertisement and the observed `Plaud Note Pro` profile.
+Note Pro encrypted sessions use existing paired-app RSA credentials imported
+with `plaude auth import-pro`. A real Pro recording has been downloaded and
+decoded to a playable WAV on Apple Silicon.
+
+Automatic `auth bootstrap` currently requires Linux/BlueZ. On macOS, import
+an original Note device token with `auth set-token` or `auth import`; Note Pro
+requires `auth import-pro`. See [macOS setup](docs/usage/macos.md).
 
 ```bash
-git clone https://github.com/plaude-cli/plaude-cli
+git clone https://github.com/tonyxiao/plaude-cli
 cd plaude-cli
 make install    # installs `plaude` to ~/.cargo/bin
 ```

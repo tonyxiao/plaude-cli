@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use btleplug::{
-    api::{Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType},
+    api::{Central, Characteristic, Manager as _, Peripheral as _, PeripheralProperties, ScanFilter, WriteType},
     platform::{Adapter, Manager, Peripheral},
 };
 use bytes::Bytes;
@@ -31,14 +31,14 @@ const CONTROL_IN_UUID: Uuid = Uuid::from_u128(0x00002bb1_0000_1000_8000_00805f9b
 /// Control+bulk-out characteristic (device → phone, notify), UUID `0x2BB0`.
 const NOTIFY_OUT_UUID: Uuid = Uuid::from_u128(0x00002bb0_0000_1000_8000_00805f9b34fb);
 
+/// Note Pro discovery service observed in advertising data.
+const NOTE_PRO_DISCOVERY_UUID: Uuid = Uuid::from_u128(0x0000504c_0000_1000_8000_00805f9b34fb);
+
+/// Note Pro manufacturer identifier observed in advertising data.
+const NOTE_PRO_MANUFACTURER_ID: u16 = 0x005d;
+
 /// Standard SIG Battery Level characteristic, UUID `0x2A19`.
 const BATTERY_LEVEL_UUID: Uuid = Uuid::from_u128(0x00002a19_0000_1000_8000_00805f9b34fb);
-
-/// Expected local name in advertising data.
-const EXPECTED_LOCAL_NAME: &str = "PLAUD_NOTE";
-
-/// Nordic Semiconductor manufacturer ID from the advertising data.
-const NORDIC_MANUFACTURER_ID: u16 = 0x0059;
 
 // ---------------------------------------------------------------------------
 // ScanProvider
@@ -67,6 +67,7 @@ impl ScanProvider for BtleplugScanProvider {
             .map_err(|e| Error::Transport(format!("enumerate peripherals: {e}")))?;
 
         let mut candidates = Vec::new();
+        tracing::debug!(count = peripherals.len(), "BLE scan completed");
         for p in peripherals {
             if let Some(candidate) = peripheral_to_candidate(&p).await {
                 candidates.push(candidate);
@@ -80,20 +81,26 @@ impl ScanProvider for BtleplugScanProvider {
 /// profile and convert it to a `DeviceCandidate`.
 async fn peripheral_to_candidate(p: &Peripheral) -> Option<DeviceCandidate> {
     let props = p.properties().await.ok()??;
-    let name = props.local_name.as_deref()?;
-    if name != EXPECTED_LOCAL_NAME {
-        return None;
+    candidate_from_properties(&props)
+}
+
+fn candidate_from_properties(props: &PeripheralProperties) -> Option<DeviceCandidate> {
+    if props.manufacturer_data.contains_key(&NOTE_PRO_MANUFACTURER_ID) {
+        tracing::debug!(name = ?props.local_name, advertisement_name = ?props.advertisement_name, services = ?props.services, "Pro discovery metadata");
     }
-    if !props.manufacturer_data.contains_key(&NORDIC_MANUFACTURER_ID) {
-        return None;
-    }
+    // CoreBluetooth can omit the name on subsequent discoveries. Require
+    // both identifiers before supplying the observed Pro name.
+    let name = props.local_name.as_deref().or_else(|| {
+        (props.manufacturer_data.contains_key(&NOTE_PRO_MANUFACTURER_ID) && props.services.contains(&NOTE_PRO_DISCOVERY_UUID))
+            .then_some("Plaud Note Pro")
+    })?;
+    let manufacturer_id = props
+        .manufacturer_data
+        .keys()
+        .copied()
+        .find(|id| crate::discovery::matches_advertisement(name, *id))?;
     let rssi = props.rssi;
-    Some(DeviceCandidate::new(
-        name.to_owned(),
-        NORDIC_MANUFACTURER_ID,
-        rssi,
-        TransportHint::Ble,
-    ))
+    Some(DeviceCandidate::new(name.to_owned(), manufacturer_id, rssi, TransportHint::Ble))
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +115,28 @@ async fn peripheral_to_candidate(p: &Peripheral) -> Option<DeviceCandidate> {
 /// `BleChannel::rx` sender and `BleChannel::tx` receiver into btleplug
 /// GATT writes, so the session layer is completely unaware of btleplug.
 pub async fn connect_peripheral(scan_timeout: Duration) -> Result<(BleChannel, BtleplugBatteryReader)> {
+    connect(scan_timeout, false).await
+}
+
+/// Connect using the advertised Note Pro discovery service. Paired credentials
+/// independently authenticate the selected device before vendor commands run.
+///
+/// # Errors
+/// Returns a transport error if no advertising Pro can be connected.
+pub async fn connect_pro_peripheral(scan_timeout: Duration) -> Result<(BleChannel, BtleplugBatteryReader)> {
+    connect(scan_timeout, true).await
+}
+
+async fn connect(scan_timeout: Duration, pro_only: bool) -> Result<(BleChannel, BtleplugBatteryReader)> {
     let adapter = default_adapter().await?;
-    let peripheral = scan_and_find(&adapter, scan_timeout).await?;
+    let peripheral = scan_and_find(&adapter, scan_timeout, pro_only).await?;
+    let note_pro = pro_only
+        || peripheral
+            .properties()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|properties| properties.manufacturer_data.contains_key(&NOTE_PRO_MANUFACTURER_ID));
 
     peripheral
         .connect()
@@ -179,7 +206,11 @@ pub async fn connect_peripheral(scan_timeout: Duration) -> Result<(BleChannel, B
         }
     });
 
-    let battery_reader = BtleplugBatteryReader { peripheral, battery_char };
+    let battery_reader = BtleplugBatteryReader {
+        peripheral,
+        battery_char,
+        note_pro,
+    };
 
     Ok((channel, battery_reader))
 }
@@ -204,29 +235,37 @@ async fn default_adapter() -> Result<Adapter> {
 }
 
 /// Scan for a Plaud device and return the first matching peripheral.
-async fn scan_and_find(adapter: &Adapter, timeout: Duration) -> Result<Peripheral> {
+async fn scan_and_find(adapter: &Adapter, timeout: Duration, pro_only: bool) -> Result<Peripheral> {
     adapter
         .start_scan(ScanFilter::default())
         .await
         .map_err(|e| Error::Transport(format!("scan failed: {e}")))?;
-
-    tokio::time::sleep(timeout).await;
-
-    let _ = adapter.stop_scan().await;
-
-    let peripherals = adapter
-        .peripherals()
-        .await
-        .map_err(|e| Error::Transport(format!("enumerate: {e}")))?;
-
-    for p in peripherals {
-        if peripheral_to_candidate(&p).await.is_some() {
-            return Ok(p);
+    // CoreBluetooth supplies name, service, and manufacturer data in separate
+    // updates. Inspect throughout the window instead of taking one final snapshot.
+    let found = tokio::time::timeout(timeout, async {
+        loop {
+            let peripherals = adapter
+                .peripherals()
+                .await
+                .map_err(|e| Error::Transport(format!("enumerate: {e}")))?;
+            for peripheral in peripherals {
+                if let Some(candidate) = peripheral_to_candidate(&peripheral).await {
+                    if !pro_only || candidate.manufacturer_id == NOTE_PRO_MANUFACTURER_ID {
+                        return Ok(peripheral);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    })
+    .await;
+    let _ = adapter.stop_scan().await;
+    match found {
+        Ok(result) => result,
+        Err(_) => Err(Error::Transport(
+            "no Plaud Note or Note Pro device found — is it turned on and nearby?".to_owned(),
+        )),
     }
-    Err(Error::Transport(
-        "no PLAUD_NOTE device found — is it turned on and nearby?".to_owned(),
-    ))
 }
 
 /// Find a characteristic by UUID in the discovered set.
@@ -246,6 +285,15 @@ fn find_characteristic(chars: &std::collections::BTreeSet<Characteristic>, uuid:
 pub struct BtleplugBatteryReader {
     peripheral: Peripheral,
     battery_char: Characteristic,
+    note_pro: bool,
+}
+
+impl BtleplugBatteryReader {
+    /// Whether this connection matched the observed Note Pro advertising profile.
+    #[must_use]
+    pub const fn is_note_pro(&self) -> bool {
+        self.note_pro
+    }
 }
 
 #[async_trait]
@@ -258,5 +306,34 @@ impl BatteryReader for BtleplugBatteryReader {
             .map_err(|e| Error::Transport(format!("battery read failed: {e}")))?;
         let percent = data.first().copied().unwrap_or(0);
         BatteryLevel::new(percent).map_err(|e| Error::Protocol(format!("invalid battery level: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_nameless_manufacturer_without_pro_service() {
+        let mut props = PeripheralProperties::default();
+        props.manufacturer_data.insert(0x005d, vec![]);
+        assert!(candidate_from_properties(&props).is_none());
+    }
+
+    #[test]
+    fn rejects_nameless_pro_service_without_manufacturer() {
+        let mut props = PeripheralProperties::default();
+        props.services.push(Uuid::from_u128(0x0000504c_0000_1000_8000_00805f9b34fb));
+        assert!(candidate_from_properties(&props).is_none());
+    }
+
+    #[test]
+    fn recognizes_pro_without_corebluetooth_local_name() {
+        let mut props = PeripheralProperties::default();
+        props.manufacturer_data.insert(0x005d, vec![]);
+        props.services.push(Uuid::from_u128(0x0000504c_0000_1000_8000_00805f9b34fb));
+        let candidate = candidate_from_properties(&props).expect("observed Pro profile");
+        assert_eq!(candidate.local_name, "Plaud Note Pro");
+        assert_eq!(candidate.manufacturer_id, 0x005d);
     }
 }
