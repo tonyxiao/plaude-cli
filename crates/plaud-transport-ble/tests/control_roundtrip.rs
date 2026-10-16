@@ -13,11 +13,7 @@ const AUTH_ACCEPTED: &[u8] = &[
 ];
 const GET_DEVICE_NAME_OPCODE: u16 = 0x006C;
 const PLAUD_NAME_ASCII: &[u8] = b"PLAUD_NOTE";
-/// The opcode the test tells `send_control` to expect. It MUST be
-/// different from the one encoded in [`WRONG_OPCODE_RESPONSE`] so the
-/// session surfaces a `Protocol` error.
-const EXPECTED_OPCODE_FOR_MISMATCH: u16 = 0xDEAD;
-const WRONG_OPCODE_RESPONSE: &[u8] = &[0x01, 0xef, 0xbe, 0xaa];
+const UNSOLICITED_RESPONSE: &[u8] = &[0x01, 0x09, 0x00, 0xaa];
 
 fn token() -> AuthToken {
     AuthToken::new(SAMPLE_TOKEN).expect("hand-validated")
@@ -63,14 +59,58 @@ async fn send_control_without_auth_returns_auth_required() {
     assert!(matches!(err, Error::AuthRequired));
 }
 
+// Journey: specs/journeys/JOURNEY-20261016-macos-note-pro.md
 #[tokio::test]
-async fn send_control_returns_protocol_error_on_opcode_mismatch() {
+async fn send_control_ignores_unsolicited_notifications_before_matching_response() {
     let (mut session, mut peer) = authenticated_session().await;
     tokio::spawn(async move {
         let _ = peer.receive().await;
-        peer.send(Bytes::from_static(WRONG_OPCODE_RESPONSE)).await.expect("send");
+        peer.send(Bytes::from_static(UNSOLICITED_RESPONSE))
+            .await
+            .expect("unsolicited update");
+        peer.send(Bytes::from_static(&[1, 0x6c, 0, 42])).await.expect("matching response");
     });
     let frame = plaud_proto::encode::device::get_device_name();
-    let err = session.send_control(frame, EXPECTED_OPCODE_FOR_MISMATCH).await.unwrap_err();
-    assert!(matches!(err, Error::Protocol(_)));
+    let payload = session
+        .send_control(frame, GET_DEVICE_NAME_OPCODE)
+        .await
+        .expect("matching response");
+    assert_eq!(&payload[..], &[42]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsolicited_notifications_do_not_extend_the_command_deadline() {
+    let (mut session, mut peer) = authenticated_session().await;
+    tokio::spawn(async move {
+        let _ = peer.receive().await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if peer.send(Bytes::from_static(UNSOLICITED_RESPONSE)).await.is_err() {
+                break;
+            }
+        }
+    });
+    let result = session
+        .send_control(plaud_proto::encode::device::get_device_name(), GET_DEVICE_NAME_OPCODE)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout { seconds: 5 })));
+}
+
+#[tokio::test(start_paused = true)]
+async fn multi_response_listing_skips_unsolicited_updates() {
+    let (mut session, mut peer) = authenticated_session().await;
+    let device = tokio::spawn(async move {
+        let _ = peer.receive().await;
+        peer.send(Bytes::from_static(UNSOLICITED_RESPONSE)).await.expect("update");
+        peer.send(Bytes::from_static(&[1, 0x1a, 0, 42])).await.expect("batch");
+        peer.send(Bytes::from_static(UNSOLICITED_RESPONSE)).await.expect("update");
+        peer.send(Bytes::from_static(&[1, 0x1a, 0, 43])).await.expect("batch");
+        std::future::pending::<()>().await;
+    });
+    let result = session
+        .send_control_multi(Bytes::from_static(&[1, 0x1a, 0]), 0x1a)
+        .await
+        .expect("listing");
+    assert_eq!(result, vec![Bytes::from_static(&[42]), Bytes::from_static(&[43])]);
+    device.abort();
 }

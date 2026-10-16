@@ -5,6 +5,8 @@ Connects over Bluetooth — no cloud, no phone app needed after initial setup.
 
 ## Quick Start
 
+For Apple Silicon setup and current device limits, see [macOS setup](macos.md).
+
 ### 1. Install
 
 ```bash
@@ -19,7 +21,7 @@ If you already have your token (32 hex characters):
 plaude auth set-token <your-32-hex-token>
 ```
 
-Or capture it automatically from the phone app (requires the Plaud app open on your phone):
+Or capture it automatically on Linux/BlueZ (requires the Plaud app open on your phone):
 
 ```bash
 plaude auth bootstrap

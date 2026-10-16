@@ -91,7 +91,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config_dir: Option<PathBuf>,
 
-    /// Runtime backend: `sim` uses the in-process simulator, `ble` is reserved for the future real-hardware backend, `usb` mounts a pre-deprecation PLAUD_NOTE VFAT volume.
+    /// Runtime backend: Bluetooth (default), Note Pro Wi-Fi fast transfer, USB volume, or simulator.
     #[arg(long, global = true, value_enum, default_value_t = Backend::Ble)]
     backend: Backend,
 
@@ -247,28 +247,53 @@ fn dispatch(cli: Cli) -> Result<(), DispatchError> {
         None => Err(DispatchError::Usage("no subcommand supplied; run `plaude --help`".to_owned())),
         Some(Commands::Auth(auth_cmd)) => runtime.block_on(commands::auth::run(auth_cmd, config_dir, cli.backend)),
         Some(Commands::Battery(battery_cmd)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::battery::run(battery_cmd, provider.as_ref()))
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(&runtime, provider.as_ref(), commands::battery::run(battery_cmd, provider.as_ref()))
         }
         Some(Commands::Device(device_cmd)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::device::run(device_cmd, provider.as_ref(), config_dir))
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(
+                &runtime,
+                provider.as_ref(),
+                commands::device::run(device_cmd, provider.as_ref(), config_dir),
+            )
         }
         Some(Commands::Files(files_cmd)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::files::run(files_cmd, provider.as_ref(), config_dir))
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(
+                &runtime,
+                provider.as_ref(),
+                commands::files::run(files_cmd, provider.as_ref(), config_dir),
+            )
         }
         Some(Commands::Record(record_cmd)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::record::run(record_cmd, provider.as_ref(), config_dir))
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(
+                &runtime,
+                provider.as_ref(),
+                commands::record::run(record_cmd, provider.as_ref(), config_dir),
+            )
         }
         Some(Commands::Settings(settings_cmd)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::settings::run(settings_cmd, provider.as_ref(), config_dir))
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(
+                &runtime,
+                provider.as_ref(),
+                commands::settings::run(settings_cmd, provider.as_ref(), config_dir),
+            )
         }
         Some(Commands::Sync(sync_args)) => {
-            let provider = cli.backend.provider(cli.mount.as_deref());
-            runtime.block_on(commands::sync::run(sync_args, provider.as_ref(), config_dir))
+            if cli.backend == Backend::Wifi {
+                return Err(DispatchError::Usage(
+                    "Wi-Fi supports files list/pull-one; sync is not supported yet".into(),
+                ));
+            }
+            let provider = cli.backend.provider(cli.mount.as_deref(), config_dir);
+            run_with_cleanup(
+                &runtime,
+                provider.as_ref(),
+                commands::sync::run(sync_args, provider.as_ref(), config_dir),
+            )
         }
         #[cfg(feature = "transcribe")]
         Some(Commands::Transcribe(transcribe_args)) => commands::transcribe::run(transcribe_args),
@@ -283,6 +308,42 @@ fn dispatch(cli: Cli) -> Result<(), DispatchError> {
         #[cfg(feature = "llm")]
         Some(Commands::Template(template_cmd)) => commands::template::run(template_cmd, config_dir),
     }
+}
+
+/// Run a command with cleanup outside the cancellable future.
+fn run_with_cleanup<F>(
+    runtime: &tokio::runtime::Runtime,
+    provider: &dyn commands::backend::TransportProvider,
+    command: F,
+) -> Result<(), DispatchError>
+where
+    F: std::future::Future<Output = Result<(), DispatchError>>,
+{
+    runtime.block_on(async {
+        let result=tokio::select! {
+            result=futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(command))=>match result {Ok(result)=>result,Err(_)=>Err(DispatchError::Runtime("command panicked; restoring network".into()))},
+            signal=termination_signal()=>Err(DispatchError::Runtime(if signal.is_ok(){"interrupted".to_owned()}else{"cannot listen for termination signals".to_owned()})),
+        };
+        let cleanup=provider.shutdown().await.map_err(|e|DispatchError::Runtime(e.to_string()));
+        match (result,cleanup) {
+            (Ok(()),Ok(()))=>Ok(()),
+            (Err(error),Ok(())) | (Ok(()),Err(error))=>Err(error),
+            (Err(error),Err(cleanup))=>Err(DispatchError::Runtime(format!("{error:?}; cleanup failed: {cleanup:?}"))),
+        }
+    })
+}
+
+/// Catch normal terminal/process termination so async network cleanup can finish.
+async fn termination_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        tokio::select! { result=tokio::signal::ctrl_c()=>result,_=terminate.recv()=>Ok(()),_=hangup.recv()=>Ok(()) }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 /// Errors surfaced by `dispatch` back to `main` for exit-code mapping.
@@ -321,5 +382,34 @@ impl DispatchError {
             TransportError::Transport(msg) => Self::Unavailable(format!("transport error: {msg}")),
             other => Self::Runtime(format!("{other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Provider(AtomicUsize);
+    #[async_trait::async_trait]
+    impl commands::backend::TransportProvider for Provider {
+        async fn connect_anonymous(&self) -> plaud_transport::Result<Box<dyn plaud_transport::Transport>> {
+            Err(TransportError::AuthRequired)
+        }
+        async fn connect_authenticated(&self, _: plaud_domain::AuthToken) -> plaud_transport::Result<Box<dyn plaud_transport::Transport>> {
+            Err(TransportError::AuthRequired)
+        }
+        async fn shutdown(&self) -> plaud_transport::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[test]
+    fn cleans_up_success_failure_and_panic() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let provider = Provider(AtomicUsize::new(0));
+        assert!(run_with_cleanup(&runtime, &provider, async { Ok(()) }).is_ok());
+        assert!(run_with_cleanup(&runtime, &provider, async { Err(DispatchError::Runtime("setup failed".into())) }).is_err());
+        assert!(run_with_cleanup(&runtime, &provider, async { panic!("transfer failed") }).is_err());
+        assert_eq!(provider.0.load(Ordering::SeqCst), 3);
     }
 }

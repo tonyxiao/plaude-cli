@@ -21,6 +21,7 @@ fn cmd(tmp: &TempDir) -> Command {
 }
 
 #[test]
+#[ignore = "requires a physical Bluetooth recorder; run explicitly with --ignored"]
 fn ble_backend_succeeds_or_reports_unavailable() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Real btleplug backend: exit 0 if a Plaud device is nearby,

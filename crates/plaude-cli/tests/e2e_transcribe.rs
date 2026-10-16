@@ -5,6 +5,8 @@
 //!
 //! Journey: specs/transcription/ROADMAP.md — T1
 
+#![cfg(feature = "transcribe")]
+
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
@@ -63,7 +65,9 @@ fn transcribe_accepts_quality_flag() {
     // message will contain the model filename — proving the quality
     // preset was resolved correctly.
     let output = cmd(&tmp)
-        .args(["transcribe", "--quality", "fast", wav.to_str().unwrap()])
+        .args(["transcribe", "--quality", "fast", "--no-download", "--models-dir"])
+        .arg(tmp.path())
+        .arg(&wav)
         .output()
         .expect("run");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -93,7 +97,17 @@ fn transcribe_multilingual_language_uses_different_model() {
     let wav = tmp.path().join("test.wav");
     std::fs::write(&wav, b"RIFF\x00\x00\x00\x00WAVEfmt ").expect("write wav");
     let output = cmd(&tmp)
-        .args(["transcribe", "--quality", "fast", "--language", "de", wav.to_str().unwrap()])
+        .args([
+            "transcribe",
+            "--quality",
+            "fast",
+            "--language",
+            "de",
+            "--no-download",
+            "--models-dir",
+        ])
+        .arg(tmp.path())
+        .arg(&wav)
         .output()
         .expect("run");
     let stderr = String::from_utf8_lossy(&output.stderr);

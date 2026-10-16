@@ -8,5 +8,23 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+plaud-domain.workspace = true
+plaud-transport.workspace = true
+plaud-transport-ble.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "process", "signal", "io-util"] }
+futures.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+tokio-tungstenite = "0.26"
+md-5 = "0.10"
+tempfile.workspace = true
+
+[dev-dependencies]
+plaud-sim.workspace = true
+
 [lints]
 workspace = true

@@ -48,7 +48,7 @@ exists is the evidence and specification tree:
 | Protocol spec (BLE) | ✅ Complete | `docs/protocol/ble-gatt.md`, `docs/protocol/ble-commands.md` |
 | Protocol spec (file formats) | ✅ Complete | `docs/protocol/file-formats.md` |
 | Protocol spec (overview + security) | ✅ Complete | `docs/protocol/overview.md` |
-| Protocol spec (Wi-Fi Fast Transfer) | 🟡 Stub | `docs/protocol/wifi-fast-transfer.md` |
+| Protocol spec (Wi-Fi Fast Transfer) | 🟡 SDK-mapped; native implementation under hardware validation | `docs/protocol/wifi-fast-transfer.md` |
 | R0 BLE passive recon | ✅ | `specs/re/captures/ble-gatt/2026-04-05-hci0-plaud-note-r0-partial.md` |
 | R2 dynamic capture (resumption) | ✅ | `specs/re/captures/btsnoop/2026-04-05-plaud-sync-session.md` |
 | R2 dynamic capture (0day re-pair) | ✅ | `specs/re/captures/btsnoop/2026-04-05-plaud-0day-pair.md` |
@@ -781,3 +781,16 @@ into full milestone sections and journey docs when the work begins.
 | 2026-04-06 | M15 | **Closed (stretch).** `plaude-cli transcribe` ships as a thin wrapper around a user-supplied `whisper.cpp` CLI binary for offline local transcription. `--whisper-bin <PATH>` + `PLAUDE_WHISPER_BIN` env var locates the binary (defaults to `whisper-cli` on `$PATH`). `--model <PATH>` + `PLAUDE_WHISPER_MODEL` (required) points at a GGML model file. `--language <LANG>` passes a language hint; `--output-format txt\|srt\|vtt` selects the output format. One or more WAV file paths accepted as positional args. Exit codes follow the M12 sysexits convention: 0=success, 1=runtime error (WAV not found, whisper process failure), 2=usage error (model not found, no files), 69=unavailable (whisper binary not found). Subprocess stdout is forwarded to the CLI's stdout; whisper's `--no-prints` flag suppresses non-transcript output. New `commands/transcribe.rs` module with `TranscribeArgs` + `TranscribeFormat` enum + `run()` entry point + `transcribe_one()` per-file driver. 1 unit test (format flag mapping) + 6 e2e tests with mock shell-script whisper binaries covering happy path, missing binary, missing model, missing WAV, whisper failure, and no-files-arg. 341 tests total green, `make lint` clean, zero dead code. Docs at `docs/usage/transcribe.md`. See [`journeys/M15-whisper-transcribe.md`](journeys/M15-whisper-transcribe.md) Implementation section. |
 
 *(Append one row per closed milestone. Do not rewrite completed rows.)*
+
+## Platform follow-up
+
+- [macOS and Note Pro discovery](../journeys/JOURNEY-20261016-macos-note-pro.md):
+  native build and battery access verified; authenticated Pro transfer pending.
+
+### 2026-10-16 Note Pro Wi-Fi implementation
+
+Explicit `--backend wifi` supports file listing/pull-one with encrypted WebSocket
+sessions and Mac association/restoration. This does not close M13's broader
+automatic `sync` milestone. See [journey](../journeys/JOURNEY-20261016-note-pro-wifi.md)
+and [Mac usage](../../docs/usage/macos.md). Hardware highlights are retained in
+ASR/Ogg and exported opaque metadata; decoded PTAG timing remains unvalidated.

@@ -41,7 +41,7 @@ serde_json = "1.0"
 indicatif = "0.17"
 jiff = "0.2"
 opus-decoder = "0.1"
-whisper-rs = { version = "0.16", features = ["cuda", "vulkan"] }
+whisper-rs = { version = "0.16" }
 hound = "3.5"
 ureq = "3.3"
 pyannote-rs = "0.3"
@@ -51,6 +51,11 @@ toml = "0.8"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 futures = "0.3"
 uuid = "1.16"
+base64 = "0.22"
+rsa = "0.9"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+ogg = "0.9"
 
 # In-workspace crates
 plaud-domain = { path = "crates/plaud-domain" }

@@ -58,3 +58,9 @@ impl DeviceDiscovery for BleDiscovery {
         })
     }
 }
+
+/// Match an observed Plaud local name and manufacturer identifier.
+#[must_use]
+pub fn matches_advertisement(local_name: &str, manufacturer_id: u16) -> bool {
+    matches!((local_name, manufacturer_id), ("PLAUD_NOTE", 0x0059) | ("Plaud Note Pro", 0x005d))
+}

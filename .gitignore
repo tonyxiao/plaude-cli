@@ -24,3 +24,14 @@ specs/re/captures/pcap/*.pcapng
 specs/re/captures/pcap/*.http.txt
 specs/re/captures/usb/*.raw
 specs/re/captures/**/unsanitised/
+
+# Local device credentials, configuration and personal recordings.
+pro-credentials.json
+wifi.json
+*.asr
+*.wav
+*.ogg
+*.oggpa
+!crates/plaud-transport-ble/tests/fixtures/pro-test-recording.asr
+!crates/plaude-cli/tests/fixtures/pro-multiplexed-silence.ogg
+!crates/plaude-cli/tests/fixtures/pro-offset-silence.ogg

@@ -82,3 +82,16 @@ Override the file location with `--config-dir`:
 ```bash
 plaude --config-dir /tmp/test auth show
 ```
+
+## Note Pro paired credentials
+
+The Pro encrypts its binding-token exchange. Import the existing paired Android
+app's signed serial, matching RSA keys, and binding token with:
+
+```sh
+plaude auth import-pro /path/to/private-pro-credentials.json
+```
+
+See [macOS and Pro setup](macos.md) for the fields and storage behavior.
+`auth clear` removes both the token and Pro credential bundle. Never replace
+these with an account JWT or a device upload license.

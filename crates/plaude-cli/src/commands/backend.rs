@@ -134,12 +134,13 @@ fn parse_env_recording_list(list: &str) -> Vec<(RecordingId, Vec<u8>, Vec<u8>)> 
 pub(crate) enum Backend {
     /// In-process simulator (`plaud-sim`). Used by every CI test.
     Sim,
-    /// Real BLE central via the future btleplug backend. Currently
-    /// returns [`TransportError::Unsupported`] at connect-time.
+    /// Real Bluetooth central for original Note and Note Pro recorders.
     Ble,
     /// USB Mass Storage fallback. Requires the global `--mount <PATH>`
     /// flag to point at the mounted `PLAUD_NOTE` VFAT volume.
     Usb,
+    /// Note Pro encrypted Wi-Fi fast transfer (requires wifi.json on macOS).
+    Wifi,
 }
 
 impl Backend {
@@ -148,10 +149,11 @@ impl Backend {
     /// `mount` is consulted only when `self == Backend::Usb`. The
     /// other variants silently ignore it so the call site stays
     /// symmetric.
-    pub(crate) fn provider(self, mount: Option<&Path>) -> Box<dyn TransportProvider> {
+    pub(crate) fn provider(self, mount: Option<&Path>, config_dir: Option<&Path>) -> Box<dyn TransportProvider> {
         match self {
+            Self::Wifi => Box::new(super::wifi::WifiProvider::new(config_dir)),
             Self::Sim => Box::new(SimProvider::new()) as Box<dyn TransportProvider>,
-            Self::Ble => Box::new(BleProvider::new()) as Box<dyn TransportProvider>,
+            Self::Ble => Box::new(BleProvider::new(config_dir)) as Box<dyn TransportProvider>,
             Self::Usb => Box::new(UsbProvider::new(mount.map(Path::to_path_buf))) as Box<dyn TransportProvider>,
         }
     }
@@ -163,6 +165,11 @@ impl Backend {
 /// commands that do.
 #[async_trait]
 pub(crate) trait TransportProvider: Send + Sync {
+    /// Explicit async cleanup; called even when setup or a command is cancelled.
+    async fn shutdown(&self) -> TransportResult<()> {
+        Ok(())
+    }
+
     /// Connect without offering a token. The returned [`Transport`]
     /// is guaranteed to answer `battery()` successfully; any vendor
     /// opcode may return [`TransportError::AuthRequired`].
@@ -211,14 +218,18 @@ impl TransportProvider for SimProvider {
 /// Scans for a `PLAUD_NOTE` device, connects, enables CCCD,
 /// bridges GATT I/O into the existing `BleSession` protocol layer,
 /// and returns a fully functional `BleTransport`.
-pub(crate) struct BleProvider;
+pub(crate) struct BleProvider {
+    config_dir: Option<PathBuf>,
+}
 
 /// Default BLE scan timeout in seconds.
-const BLE_SCAN_TIMEOUT_SECS: u64 = 5;
+const BLE_SCAN_TIMEOUT_SECS: u64 = 15;
 
 impl BleProvider {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(config_dir: Option<&Path>) -> Self {
+        Self {
+            config_dir: config_dir.map(Path::to_path_buf),
+        }
     }
 }
 
@@ -241,10 +252,34 @@ impl TransportProvider for BleProvider {
     async fn connect_authenticated(&self, token: AuthToken) -> TransportResult<Box<dyn Transport>> {
         use std::{sync::Arc, time::Duration};
 
-        use plaud_transport_ble::{BleSession, BleTransport, backend::connect_peripheral};
+        use plaud_transport_ble::{
+            BleSession, BleTransport,
+            backend::{connect_peripheral, connect_pro_peripheral},
+        };
         use tokio::sync::Mutex;
 
-        let (channel, battery_reader) = connect_peripheral(Duration::from_secs(BLE_SCAN_TIMEOUT_SECS)).await?;
+        let credentials = plaud_auth::pro::load(self.config_dir.as_deref()).await?;
+        let scan_timeout = Duration::from_secs(BLE_SCAN_TIMEOUT_SECS);
+        let (channel, battery_reader) = if credentials.is_some() {
+            connect_pro_peripheral(scan_timeout).await?
+        } else {
+            connect_peripheral(scan_timeout).await?
+        };
+        let channel = if let Some(credentials) = credentials {
+            plaud_transport_ble::crypto::secure_channel(
+                channel,
+                &credentials.sn_signature,
+                &credentials.public_key,
+                &credentials.private_key,
+            )
+            .await?
+        } else if battery_reader.is_note_pro() {
+            return Err(TransportError::Unsupported {
+                capability: "Note Pro requires `plaude auth import-pro <credentials.json>`",
+            });
+        } else {
+            channel
+        };
         let mut session = BleSession::new(channel);
         session.authenticate(&token).await?;
         Ok(Box::new(BleTransport::from_parts(
@@ -293,11 +328,12 @@ mod tests {
     use super::{Backend, BleProvider, SimProvider, TransportProvider};
 
     #[tokio::test]
+    #[ignore = "requires a real Bluetooth adapter; run explicitly with --ignored"]
     async fn ble_provider_connect_anonymous_fails_without_hardware() {
         // The real btleplug backend needs a BLE adapter. In CI it
         // returns a Transport error; on a developer machine with BLE
         // it might succeed. We just verify it doesn't panic.
-        let provider = BleProvider::new();
+        let provider = BleProvider::new(None);
         let _ = provider.connect_anonymous().await;
     }
 
@@ -315,8 +351,8 @@ mod tests {
     fn backend_enum_provider_factory_returns_a_matching_impl() {
         // Smoke: every variant can instantiate without panicking.
         // The returned trait objects are exercised by the e2e tests.
-        let _ = Backend::Sim.provider(None);
-        let _ = Backend::Ble.provider(None);
-        let _ = Backend::Usb.provider(Some(std::path::Path::new("/tmp/fixture")));
+        let _ = Backend::Sim.provider(None, None);
+        let _ = Backend::Ble.provider(None, None);
+        let _ = Backend::Usb.provider(Some(std::path::Path::new("/tmp/fixture")), None);
     }
 }

@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+# Public, generated test material documented beside the fixtures.
+[[allowlists]]
+description = "Synthetic RSA fixture; never used with a real account or device"
+paths = ['''^crates/plaud-transport-ble/tests/fixtures/pro-test-private\.pem$''']
+
+[[allowlists]]
+description = "Fixed dummy token in the isolated credential-storage unit test"
+condition = "AND"
+paths = ['''^crates/plaud-auth/src/pro\.rs$''']
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef$''']

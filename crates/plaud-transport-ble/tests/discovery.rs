@@ -46,3 +46,20 @@ async fn connect_is_not_wired_in_m5_and_returns_unsupported() {
         Ok(_) => panic!("expected Unsupported, got Ok(transport)"),
     }
 }
+
+#[test]
+fn matches_original_note_advertisement() {
+    assert!(plaud_transport_ble::discovery::matches_advertisement("PLAUD_NOTE", 0x0059));
+}
+
+#[test]
+fn matches_live_note_pro_advertisement() {
+    assert!(plaud_transport_ble::discovery::matches_advertisement("Plaud Note Pro", 0x005d));
+}
+
+#[test]
+fn rejects_unrelated_or_mismatched_advertisements() {
+    for (name, id) in [("headphones", 0x005d), ("PLAUD_NOTE", 0x005d), ("Plaud Note Pro", 0x0059)] {
+        assert!(!plaud_transport_ble::discovery::matches_advertisement(name, id));
+    }
+}
